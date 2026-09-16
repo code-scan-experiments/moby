@@ -251,6 +251,33 @@ func handleProbeResult(d *Daemon, c *container.Container, result *containertypes
 	}
 }
 
+// healthCheckInterval returns how long the monitor should sleep before the
+// next probe. While the container is still Starting, probes run at
+// startInterval: for the whole start period when one is configured, or
+// until the first result is recorded when startPeriod is 0 (the default).
+// Once the start period has elapsed, or the container has left the Starting
+// state, the regular probeInterval is used.
+func healthCheckInterval(sinceStart, startPeriod, startInterval, probeInterval time.Duration, status containertypes.HealthStatus) time.Duration {
+	if status != containertypes.Starting {
+		return probeInterval
+	}
+	if startPeriod == 0 {
+		// No start period configured: startInterval still applies while
+		// the container is Starting (moby/moby#49900).
+		return startInterval
+	}
+	if sinceStart >= startPeriod {
+		return probeInterval
+	}
+	// Cap the interval so we don't sleep past the end of the start period.
+	// Without this, a large StartInterval would delay the transition to
+	// the regular probe cadence.
+	if remaining := startPeriod - sinceStart; startInterval > remaining {
+		return remaining
+	}
+	return startInterval
+}
+
 // Run the container's monitoring thread until notified via "stop".
 // There is never more than one monitor thread running per container at a time.
 func monitor(d *Daemon, c *container.Container, stop chan struct{}, probe probe) {
@@ -263,25 +290,10 @@ func monitor(d *Daemon, c *container.Container, stop chan struct{}, probe probe)
 	c.Unlock()
 
 	getInterval := func() time.Duration {
-		sinceStart := time.Since(started)
-		if sinceStart >= startPeriod {
-			return probeInterval
-		}
 		c.Lock()
 		status := c.State.Health.Health.Status
 		c.Unlock()
-
-		if status == containertypes.Starting {
-			// Cap the interval so we don't sleep past the end of the
-			// start period. Without this, a large StartInterval would
-			// delay the transition to the regular probe cadence.
-			remaining := startPeriod - sinceStart
-			if startInterval > remaining {
-				return remaining
-			}
-			return startInterval
-		}
-		return probeInterval
+		return healthCheckInterval(time.Since(started), startPeriod, startInterval, probeInterval, status)
 	}
 
 	intervalTimer := time.NewTimer(getInterval())
