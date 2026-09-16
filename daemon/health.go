@@ -253,18 +253,24 @@ func handleProbeResult(d *Daemon, c *container.Container, result *containertypes
 
 // healthCheckInterval returns how long the monitor should sleep before the
 // next probe. While the container is still Starting, probes run at
-// startInterval: for the whole start period when one is configured, or
-// until the first result is recorded when startPeriod is 0 (the default).
-// Once the start period has elapsed, or the container has left the Starting
-// state, the regular probeInterval is used.
-func healthCheckInterval(sinceStart, startPeriod, startInterval, probeInterval time.Duration, status containertypes.HealthStatus) time.Duration {
+// startInterval: for the whole start period when one is configured, or,
+// when startPeriod is 0 (the default), only if StartInterval was explicitly
+// configured, until the first result is recorded. Once the start period has
+// elapsed, or the container has left the Starting state, the regular
+// probeInterval is used.
+func healthCheckInterval(sinceStart, startPeriod, startInterval, probeInterval time.Duration, startIntervalConfigured bool, status containertypes.HealthStatus) time.Duration {
 	if status != containertypes.Starting {
 		return probeInterval
 	}
 	if startPeriod == 0 {
-		// No start period configured: startInterval still applies while
-		// the container is Starting (moby/moby#49900).
-		return startInterval
+		// No start period configured. Only an explicitly configured
+		// start interval applies while the container is Starting
+		// (moby/moby#49900); the 5s default would otherwise shorten the
+		// grace period before a container is reported unhealthy.
+		if startIntervalConfigured {
+			return startInterval
+		}
+		return probeInterval
 	}
 	if sinceStart >= startPeriod {
 		return probeInterval
@@ -283,6 +289,7 @@ func healthCheckInterval(sinceStart, startPeriod, startInterval, probeInterval t
 func monitor(d *Daemon, c *container.Container, stop chan struct{}, probe probe) {
 	probeInterval := timeoutWithDefault(c.Config.Healthcheck.Interval, defaultProbeInterval)
 	startInterval := timeoutWithDefault(c.Config.Healthcheck.StartInterval, defaultStartInterval)
+	startIntervalConfigured := c.Config.Healthcheck.StartInterval != 0
 	startPeriod := timeoutWithDefault(c.Config.Healthcheck.StartPeriod, defaultStartPeriod)
 
 	c.Lock()
@@ -293,7 +300,7 @@ func monitor(d *Daemon, c *container.Container, stop chan struct{}, probe probe)
 		c.Lock()
 		status := c.State.Health.Health.Status
 		c.Unlock()
-		return healthCheckInterval(time.Since(started), startPeriod, startInterval, probeInterval, status)
+		return healthCheckInterval(time.Since(started), startPeriod, startInterval, probeInterval, startIntervalConfigured, status)
 	}
 
 	intervalTimer := time.NewTimer(getInterval())

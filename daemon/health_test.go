@@ -172,37 +172,45 @@ func TestHealthcheckEmptyCommand(t *testing.T) {
 // TestHealthCheckInterval covers the interval-selection logic the monitor
 // uses between probes: startInterval while the container is Starting (for
 // the configured start period, or until the first result when no start
-// period is configured), capped so a probe never sleeps past the end of
-// the start period, and probeInterval otherwise.
+// period is configured but StartInterval was explicitly set), capped so a
+// probe never sleeps past the end of the start period, and probeInterval
+// otherwise.
 func TestHealthCheckInterval(t *testing.T) {
 	const (
 		probeInterval = 30 * time.Second
 		startInterval = 5 * time.Second
 	)
 	tests := []struct {
-		name          string
-		sinceStart    time.Duration
-		startPeriod   time.Duration
-		startInterval time.Duration
-		status        containertypes.HealthStatus
-		expected      time.Duration
+		name                    string
+		sinceStart              time.Duration
+		startPeriod             time.Duration
+		startInterval           time.Duration
+		startIntervalConfigured bool
+		status                  containertypes.HealthStatus
+		expected                time.Duration
 	}{
-		// With no start period configured (the default), startInterval
-		// still applies while the container is Starting
-		// (moby/moby#49900); once it leaves Starting the regular
+		// With no start period configured (the default), an explicitly
+		// configured start interval still applies while the container is
+		// Starting (moby/moby#49900); once it leaves Starting the regular
 		// probeInterval is used.
-		{name: "start period 0, starting uses start interval", sinceStart: time.Second, startPeriod: 0, status: containertypes.Starting, expected: startInterval},
-		{name: "start period 0, healthy uses probe interval", sinceStart: time.Second, startPeriod: 0, status: containertypes.Healthy, expected: probeInterval},
-		{name: "start period 0, unhealthy uses probe interval", sinceStart: time.Second, startPeriod: 0, status: containertypes.Unhealthy, expected: probeInterval},
-		{name: "inside start period, starting uses start interval", sinceStart: 10 * time.Second, startPeriod: 60 * time.Second, status: containertypes.Starting, expected: startInterval},
-		{name: "inside start period, healthy uses probe interval", sinceStart: 10 * time.Second, startPeriod: 60 * time.Second, status: containertypes.Healthy, expected: probeInterval},
-		{name: "after start period, starting uses probe interval", sinceStart: 60 * time.Second, startPeriod: 60 * time.Second, status: containertypes.Starting, expected: probeInterval},
-		{name: "after start period, healthy uses probe interval", sinceStart: 90 * time.Second, startPeriod: 60 * time.Second, status: containertypes.Healthy, expected: probeInterval},
+		{name: "start period 0, starting uses start interval", sinceStart: time.Second, startPeriod: 0, startIntervalConfigured: true, status: containertypes.Starting, expected: startInterval},
+		{name: "start period 0, healthy uses probe interval", sinceStart: time.Second, startPeriod: 0, startIntervalConfigured: true, status: containertypes.Healthy, expected: probeInterval},
+		{name: "start period 0, unhealthy uses probe interval", sinceStart: time.Second, startPeriod: 0, startIntervalConfigured: true, status: containertypes.Unhealthy, expected: probeInterval},
+		// Without an explicit start interval, the 5s default must not
+		// apply outside a start period: probing at the default start
+		// interval rate would shorten the grace period before the
+		// container is reported unhealthy.
+		{name: "start period 0, starting with default start interval uses probe interval", sinceStart: time.Second, startPeriod: 0, startIntervalConfigured: false, status: containertypes.Starting, expected: probeInterval},
+		{name: "inside start period, starting uses start interval", sinceStart: 10 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Starting, expected: startInterval},
+		{name: "inside start period, starting with default start interval uses start interval", sinceStart: 10 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: false, status: containertypes.Starting, expected: startInterval},
+		{name: "inside start period, healthy uses probe interval", sinceStart: 10 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Healthy, expected: probeInterval},
+		{name: "after start period, starting uses probe interval", sinceStart: 60 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Starting, expected: probeInterval},
+		{name: "after start period, healthy uses probe interval", sinceStart: 90 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Healthy, expected: probeInterval},
 		// The interval is capped at the remaining start period so we
 		// don't sleep past it, unless it fits exactly.
-		{name: "start interval capped to remaining start period", sinceStart: 57 * time.Second, startPeriod: 60 * time.Second, status: containertypes.Starting, expected: 3 * time.Second},
-		{name: "start interval exactly remaining is not capped", sinceStart: 55 * time.Second, startPeriod: 60 * time.Second, status: containertypes.Starting, expected: startInterval},
-		{name: "large start interval capped to remaining", sinceStart: time.Second, startPeriod: 10 * time.Second, startInterval: 60 * time.Second, status: containertypes.Starting, expected: 9 * time.Second},
+		{name: "start interval capped to remaining start period", sinceStart: 57 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Starting, expected: 3 * time.Second},
+		{name: "start interval exactly remaining is not capped", sinceStart: 55 * time.Second, startPeriod: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Starting, expected: startInterval},
+		{name: "large start interval capped to remaining", sinceStart: time.Second, startPeriod: 10 * time.Second, startInterval: 60 * time.Second, startIntervalConfigured: true, status: containertypes.Starting, expected: 9 * time.Second},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -210,7 +218,7 @@ func TestHealthCheckInterval(t *testing.T) {
 			if si == 0 {
 				si = startInterval
 			}
-			got := healthCheckInterval(tc.sinceStart, tc.startPeriod, si, probeInterval, tc.status)
+			got := healthCheckInterval(tc.sinceStart, tc.startPeriod, si, probeInterval, tc.startIntervalConfigured, tc.status)
 			assert.Check(t, is.Equal(tc.expected, got))
 		})
 	}
