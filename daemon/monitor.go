@@ -31,6 +31,60 @@ func (daemon *Daemon) setStateCounter(c *container.Container) {
 	}
 }
 
+// containerExitAction is the outcome of the restart / stop / auto-remove
+// decision taken by [Daemon.handleContainerExit] once a container's task has
+// exited.
+type containerExitAction struct {
+	// restart is true when the container must transition to "restarting"
+	// and be started again once wait is signalled.
+	restart bool
+	// wait is signalled by the restart-manager once the restart back-off
+	// has elapsed (or with an error if the restart was canceled). It is nil
+	// when restart is false.
+	wait chan error
+	// autoRemove is true when the container must be auto-removed (subject
+	// to HostConfig.AutoRemove) after transitioning to "exited".
+	autoRemove bool
+	// execDuration is how long the container ran before exiting.
+	execDuration time.Duration
+}
+
+// decideContainerExitAction asks the container's restart-manager whether the
+// container should be restarted, and derives the stop / auto-remove outcome
+// from the answer. It must be called with the container lock held.
+//
+// Auto-removal is suppressed when the container has been manually restarted
+// ("docker restart"), because the restart path will start it again itself.
+func decideContainerExitAction(ctx context.Context, c *container.Container, exitStatus container.ExitStatus, daemonShutdown bool) containerExitAction {
+	execDuration := time.Since(c.State.StartedAt)
+	restart, wait, err := c.RestartManager().ShouldRestart(uint32(exitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
+	if err != nil {
+		// Ignore ErrRestartCanceled errors, which mean the restart-manager
+		// was stopped (e.g., during daemon shutdown).
+		if !errors.Is(err, restartmanager.ErrRestartCanceled) {
+			log.G(ctx).WithFields(log.Fields{
+				"error":                  err,
+				"container":              c.ID,
+				"restartCount":           c.RestartCount,
+				"exitCode":               exitStatus.ExitCode,
+				"exitedAt":               exitStatus.ExitedAt,
+				"daemonShuttingDown":     daemonShutdown,
+				"hasBeenManuallyStopped": c.HasBeenManuallyStopped,
+				"execDuration":           execDuration,
+			}).Warn("ShouldRestart failed: container will not be restarted")
+		}
+		restart = false
+		wait = nil
+	}
+
+	return containerExitAction{
+		restart:      restart,
+		wait:         wait,
+		autoRemove:   !restart && !c.HasBeenManuallyRestarted,
+		execDuration: execDuration,
+	}
+}
+
 func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontainerdtypes.EventInfo) error {
 	var ctrExitStatus container.ExitStatus
 	c.Lock()
@@ -94,34 +148,15 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 		}
 	}
 
-	daemonShutdown := daemon.IsShuttingDown()
-	execDuration := time.Since(c.State.StartedAt)
-	restart, wait, err := c.RestartManager().ShouldRestart(uint32(ctrExitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
-	if err != nil {
-		// Ignore ErrRestartCanceled errors, which mean the restart-manager
-		// was stopped (e.g., during daemon shutdown).
-		if !errors.Is(err, restartmanager.ErrRestartCanceled) {
-			log.G(ctx).WithFields(log.Fields{
-				"error":                  err,
-				"container":              c.ID,
-				"restartCount":           c.RestartCount,
-				"exitCode":               ctrExitStatus.ExitCode,
-				"exitedAt":               ctrExitStatus.ExitedAt,
-				"daemonShuttingDown":     daemonShutdown,
-				"hasBeenManuallyStopped": c.HasBeenManuallyStopped,
-				"execDuration":           execDuration,
-			}).Warn("ShouldRestart failed: container will not be restarted")
-		}
-		restart = false
-	}
+	action := decideContainerExitAction(ctx, c, ctrExitStatus, daemon.IsShuttingDown())
 
 	attributes := map[string]string{
 		"exitCode":     strconv.Itoa(ctrExitStatus.ExitCode),
-		"execDuration": strconv.Itoa(int(execDuration.Seconds())),
+		"execDuration": strconv.Itoa(int(action.execDuration.Seconds())),
 	}
 	daemon.Cleanup(context.TODO(), c)
 
-	if restart {
+	if action.restart {
 		c.RestartCount++
 		log.G(ctx).WithFields(log.Fields{
 			"container":     c.ID,
@@ -134,7 +169,7 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 		c.State.SetRestarting(&ctrExitStatus)
 	} else {
 		c.State.SetStopped(&ctrExitStatus)
-		if !c.HasBeenManuallyRestarted {
+		if action.autoRemove {
 			defer daemon.autoRemove(&cfg.Config, c)
 		}
 	}
@@ -145,9 +180,9 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 
 	daemon.LogContainerEventWithAttributes(c, events.ActionDie, attributes)
 
-	if restart {
+	if action.restart {
 		go func() {
-			waitErr := <-wait
+			waitErr := <-action.wait
 			if waitErr == nil {
 				// daemon.netController is initialized when daemon is restoring containers.
 				// But containerStart will use daemon.netController segment.
